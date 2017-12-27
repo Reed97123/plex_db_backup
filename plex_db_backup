@@ -1,0 +1,353 @@
+#!/usr/bin/perl -w
+
+# Installation:
+#
+# Install the XML::Dumper Perl module:
+#   cpan
+#     install XML::Dumper
+#
+# Place the script anywhere and call with:
+#   plex_db_backup -backup
+
+# Version 0.7 - Initial Version.
+# Version 0.8 - General Cleanup.
+
+use DBI;
+use XML::Dumper;
+use File::Copy;
+
+my $user_home = qx(echo ~);
+chomp $user_home;
+
+###########################################
+###
+###  Variables to be customized by User
+###
+my $server_ip     = '192.168.1.4';
+my $server_port   = '32400';
+my $dir_backup    = "$user_home/plex_backup";
+my $plex_root     = "/var/lib/plexmediaserver";
+###########################################
+
+###########################################
+###
+###  Variables Not likely to need customization
+###
+my @tables_needed = qw(accounts library_sections section_locations media_provider_resources media_subscriptions);
+my $plex_pref     = "$plex_root/Library/Application Support/Plex Media Server/Preferences.xml";
+my $plex_pid      = "$plex_root/Library/Application Support/Plex Media Server/plexmediaserver.pid";
+my $dir_plex_db   = "$plex_root/Library/Application Support/Plex Media Server/Plug-in Support/Databases";
+my $db_file       = "com.plexapp.plugins.library.db";
+my $db_file_temp  = "${db_file}_temp";
+my $xml_backup    = "plex_db.xml";
+my %data;             # Main hash for storing DB information
+my %table_col_names;  # Stores the names of the columns in the tables
+my $plex_running  = 0;
+
+
+# Usage
+$usage = " $0 [-h] [-backup] [-restore] [-verbose] [-debug] [-force]
+
+If you need to start from scratch with a clean Plex database, it is time consuming
+to enter in all your account/library/DVR settings manually.
+
+This Perl script saves database settings to an xml file which can be restored in the
+event of a database corruption.
+
+Before executing, it checks to see if Plex is actively streaming and won't continue
+unless it is forced.  Plex is shutdown before beginning and all operations are made
+to a copy of the database.  In the case of 'restore' original files are copied to a
+backup before restoration.
+
+-backup        Backup the accounts/library/DVR settings to:
+                  $dir_backup/$xml_backup
+               Backup the Preferences.xml file to:
+                  $dir_backup/Preferences.xml
+-restore       Restore the settings saved in the backup ($dir_backup)
+                  Original files are renamed.
+-verbose       More information during the run.
+-debug         Won't delete the temporary copy of the database being used for all
+               the script modification work.
+-force         Shutdown Plex even if it is actively streaming/being used.
+";
+
+# Options Handling
+use Getopt::Long;
+$Getopt::Long::ignorecase = 1;
+$Getopt::Long::autoabbrev = 1; 
+&GetOptions(
+            "backup"    => \$backup,
+            "restore"   => \$restore,
+            "verbose"   => \$verbose,
+            "force"     => \$force,
+            "debug"     => \$debug,
+            "h|help"    => \$help
+            );
+
+if ($help or $help) { print $usage; exit 0; }
+
+die "-F- Please select either -backup or -restore.\n" unless (($backup and not $restore) or (not $backup and $restore));
+
+#
+# Copy/open the database
+#
+
+# Check if Plex is running
+$plex_running = 1 if (-e $plex_pid);
+
+# Check to make sure plex isn't active, exit if active unless forced
+die "-F- Plex is currently playing.  Use -force to override.\n" if (&playing() and not $force); 
+
+# Shut-down Plex only if it is running
+&shutdown_plex if ($plex_running);
+
+# Operate only on a copy of the database
+copy("${dir_plex_db}/${db_file}", "${dir_backup}/${db_file_temp}")
+    or &my_die("Unable to copy ${dir_plex_db}/${db_file} to ${dir_backup}/${db_file_temp}: $!");
+print "-I- Copied ${dir_plex_db}/${db_file} to ${dir_backup}/${db_file_temp}\n";
+
+# Connect to a database.
+my $dbh = DBI->connect("DBI:SQLite:dbname=$dir_backup/$db_file_temp", '', '', { RaiseError => 1 }) or &my_die($DBI::errstr);
+print "-I- Opened database: $dir_backup/$db_file_temp\n";
+
+#
+#  Extract the schema for each table in the database
+#
+my $sth = $dbh->table_info('', 'main', '%', 'TABLE') or &my_die($DBI::errstr);
+while (my $r = $sth->fetchrow_hashref) {
+  my $temp_schema = $r->{sqlite_sql};
+
+  print "=ORIG==========================\n$temp_schema\n===============================\n" if (0 and $verbose);
+  if (my ($temp_table_name) = $temp_schema =~ /CREATE TABLE (?:\"|\')([^\"\']+)(?:\"|\')/)
+  {
+      $temp_schema =~ s/CREATE TABLE (?:\"|\')([^\"\']+)(?:\"|\')//; # Remove the captured table name
+      $temp_schema =~ s/DEFAULT\s+(?:\"|\')([^\"\']+)(?:\"|\')//g; # Globally remove DEFAULT values
+      $temp_schema =~ s/(\"|\')[^\"\']+$/$1/;  # Remove the trailing characters
+
+      # Only process further if there are columns in this table
+      if ($temp_schema =~ /[^\"\']+(?:\"|\')([^\"\']+)(?:\"|\')/)
+      {
+          $temp_schema =~ s/[^\"\']+(?:\"|\')([^\"\']+)(?:\"|\')/ $1/g; # Globally remove extra info
+          $temp_schema =~ s/^\s+(.*)/$1/; # Remove space at beginning
+          
+          print "Table Name:  " . $temp_table_name . "\n Col Names:  " . $temp_schema . "\n" if (0 and $verbose);
+
+          @{$table_col_names{$temp_table_name}} = split(/ /,$temp_schema);
+      }
+  }
+}
+print "-I- Table schema read for: @tables_needed\n";
+
+#
+# Backup
+#
+if ($backup) 
+{
+    copy($plex_pref, "${dir_backup}/Preferences.xml")
+        or &my_die("Unable to copy $plex_pref to ${dir_backup}/Preferences.xml: $!");
+    print "-I- Backup (preferences): $plex_pref copied to ${dir_backup}/Preferences.xml\n";
+    
+    foreach $current_table (@tables_needed) 
+    {
+        my @current_col_names = @{$table_col_names{$current_table}};
+        
+        $stmt = qq(SELECT * FROM $current_table;);
+        my $obj = $dbh->prepare($stmt);
+        $ret = $obj->execute() or &my_die($DBI::errstr);
+        &my_die($DBI::errstr) if ($ret < 0);
+
+        # Each loop is a row of the database table
+        while (my @row = $obj->fetchrow_array()) {
+            &my_die("-F- Database returned a different number of columns than listed in the table info.\n")
+                unless (@row == @current_col_names);
+            
+            for (my $x=0; $x<@row; $x++) 
+            {
+                $row[$x] = 'NULL' if (not defined $row[$x]);
+                $data{$current_table}{$row[0]}{$current_col_names[$x]} = $row[$x];
+            }
+        }
+    }
+    
+    XML::Dumper::pl2xml( \%data, "$dir_backup/$xml_backup") or &my_die("Unable to dump hash to xml file.");
+    print "-I- Backup (database): $dir_backup/$xml_backup created.\n";
+    
+    &disconnect();
+}
+
+#
+# Restore
+#
+if ($restore) 
+{
+    my $date = qx(date +%Y-%m-%d_%H-%M-%S);
+    chomp $date;
+    move($plex_pref, "${plex_pref}-${date}")
+        or &my_die("Unable to move $plex_pref to ${plex_pref}-${date}: $!");
+    print "-I- Restore (preferences): Renamed $plex_pref to ${plex_pref}-${date}\n";
+    
+    copy("${dir_backup}/Preferences.xml", $plex_pref)
+        or &my_die("Unable to copy ${dir_backup}/Preferences.xml to $plex_pref: $!");
+    &file_owner_perm($plex_pref);
+    print "-I- Restore (preferences): Moved ${dir_backup}/Preferences.xml to $plex_pref\n";
+    
+    # Read the data back in from the xml file
+    %data = %{ XML::Dumper::xml2pl("$dir_backup/$xml_backup") } or &my_die("Unable to read hash from xml file.");
+    print "-I- Restore (database): $dir_backup/$xml_backup read.\n";
+
+    # Delete all the tables to be replaced
+    foreach $current_table (keys %data) 
+    {
+        # Delete all Rows
+        $stmt = qq(DELETE from $current_table;);
+        $ret = $dbh->do($stmt) or &my_die($DBI::errstr);
+    }
+
+    # Compress/Vacuum after the deletes
+    $dbh->do('VACUUM');
+
+    foreach $current_table (keys %data) 
+    {
+        # Retrieve the column names for the current table
+        my @current_col_names = @{$table_col_names{$current_table}};
+        
+        foreach $current_id (sort {$data{$current_table}{$a} <=> $data{$current_table}{$b} } keys %{$data{$current_table}}) 
+        {
+            my @ordered_data_values;
+            my @temp_placeholders;
+            for (my $x=0; $x<@current_col_names; $x++) 
+            {
+                my $col_name = $current_col_names[$x];
+                my $col_value = $data{$current_table}{$current_id}{$col_name};
+                $col_value = undef if ($col_value eq 'NULL');
+                $ordered_data_values[$x] = $col_value;
+                push(@temp_placeholders, '?');
+            }
+            my $temp_placeholders = join(',',@temp_placeholders);
+
+            print qq(INSERT INTO $current_table VALUES ($temp_placeholders);) . "\n" if (0 and $verbose);
+            my $sth = $dbh->prepare(qq(INSERT INTO $current_table VALUES ($temp_placeholders);));
+            $sth->execute(@ordered_data_values);
+        }
+    }
+    print "-I- Restore (database): Settings restored to the temporary database.\n";
+
+    #
+    # Commit the Changes
+    #
+    
+    # Quit the database
+    $dbh->disconnect() if (defined $dbh);
+    print "-I- Database disconnected.\n";
+    
+    # Backup the current database to a file including the date/time so it can be recovered
+    move("${dir_plex_db}/${db_file}", "${dir_plex_db}/${db_file}-${date}")
+        or &my_die("Unable to move ${dir_plex_db}/${db_file} to ${dir_plex_db}/${db_file}-${date}: $!");
+    print "-I- Restore (database): Renamed ${dir_plex_db}/${db_file} to ${dir_plex_db}/${db_file}-${date}\n";
+    
+    # Move the modified copy of the database to be the new database
+    move("${dir_backup}/${db_file_temp}", "${dir_plex_db}/${db_file}")
+        or &my_die("Unable to move ${dir_backup}/${db_file_temp} to ${dir_plex_db}/${db_file}: $!");
+    &file_owner_perm("${dir_plex_db}/${db_file}");
+    print "-I- Restore (database): Moved ${dir_backup}/${db_file_temp} to ${dir_plex_db}/${db_file}\n";
+    
+    # Remove the <db>-shm and <db>-wal files
+    unlink "${dir_plex_db}/${db_file}-shm";
+    unlink "${dir_plex_db}/${db_file}-wal";
+    
+    # Start Plex only if it was previously running
+    &start_plex if ($plex_running);
+}
+
+
+#
+# Data Check
+#
+if (0 and $verbose) 
+{
+    foreach $key1 (sort keys %data) 
+    {
+        foreach $key2 (sort keys %{$data{$key1}}) 
+        {
+            foreach $key3 (sort keys %{$data{$key1}{$key2}})
+            {
+                print "$key1 $key2 $key3 $data{$key1}{$key2}{$key3}\n";
+            }
+            
+        }
+    }
+}
+
+sub my_die 
+{
+    my $error = shift @_;
+    
+    &disconnect();
+    
+    die "-F- ${error}\n";
+}
+
+sub shutdown_plex 
+{
+    system("systemctl stop plexmediaserver");
+    print "-I- Stopping plexmediaserver\n";
+}
+
+sub start_plex 
+{
+    system("systemctl start plexmediaserver");
+    print "-I- Starting plexmediaserver\n";
+}
+
+sub disconnect 
+{
+    # Quit the database
+    if (defined $dbh) 
+    {
+        $dbh->disconnect();
+        print "-I- Database disconnected.\n";
+    }
+    
+    unlink "${dir_backup}/${db_file_temp}" unless ($debug);
+
+    # Start Plex only if it was previously running
+    &start_plex if ($plex_running);
+}
+
+sub playing 
+{
+    # 0 = Not playing
+    # 1 = Playing
+    
+    my $output = qx(wget -q -O - http://$server_ip:$server_port/status/sessions);
+
+    if ($? == 0) 
+    {
+        if ($output =~ /<MediaContainer size=\"0\">/) 
+        {
+            # Not playing
+            return 0;
+        }
+        else 
+        {
+            # Playing
+            return 1;
+        }
+    }
+    else 
+    {
+        # Assume not playing
+        return 0;
+    }
+}
+
+sub file_owner_perm 
+{
+    my $file = shift @_;
+
+    my $uid = getpwnam 'plex';
+    my $gid = getgrnam 'plex';
+
+    chmod 0644, $file;
+    chown $uid, $gid, $file;
+}
